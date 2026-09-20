@@ -185,35 +185,51 @@ function handleStreamResponse(upstreamResponse, model, requestId, isWebUI) {
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || "";
+        const parsed = parseSSEPayloads(buffer);
+        buffer = parsed.remainingBuffer;
 
-        for (const line of lines) {
-          if (line.startsWith('data:')) {
-            const dataStr = line.slice(5).trim();
-            if (!dataStr || dataStr === '[DONE]') continue;
-
-            try {
-              const data = JSON.parse(dataStr);
-              
-              // StockAI 的 delta 在 data.delta 中，且类型为 text-delta
-              if (data.type === 'text-delta' && data.delta) {
-                const chunk = {
-                  id: requestId,
-                  object: "chat.completion.chunk",
-                  created: Math.floor(Date.now() / 1000),
-                  model: model,
-                  choices: [{ index: 0, delta: { content: data.delta }, finish_reason: null }]
-                };
-                await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-              }
-              // 处理结束
-              else if (data.type === 'finish') {
-                 // Do nothing, wait for loop end or explicit stop
-              }
-            } catch (e) { }
-          }
+        for (const payload of parsed.payloads) {
+          try {
+            const data = JSON.parse(payload);
+            const textDelta = extractEventText(data);
+            if (textDelta) {
+              const chunk = {
+                id: requestId,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model: model,
+                choices: [{ index: 0, delta: { content: textDelta }, finish_reason: null }]
+              };
+              await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            }
+            // 处理结束
+            else if (data.type === 'finish') {
+               // Do nothing, wait for loop end or explicit stop
+            }
+          } catch (e) { }
         }
+      }
+
+      const flushed = parseSSEPayloads(buffer, true);
+      for (const payload of flushed.payloads) {
+        try {
+          const data = JSON.parse(payload);
+          const textDelta = extractEventText(data);
+          if (textDelta) {
+            const chunk = {
+              id: requestId,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: model,
+              choices: [{ index: 0, delta: { content: textDelta }, finish_reason: null }]
+            };
+            await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+          }
+        } catch (e) { }
+      }
+      buffer = flushed.remainingBuffer;
+      if (buffer) {
+        // no-op: leftover is non-SSE or malformed fragment
       }
 
       // 发送结束标记
@@ -260,21 +276,24 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || "";
+      const parsed = parseSSEPayloads(buffer);
+      buffer = parsed.remainingBuffer;
 
-      for (const line of lines) {
-        if (line.startsWith('data:')) {
-          const dataStr = line.slice(5).trim();
-          if (!dataStr || dataStr === '[DONE]') continue;
-          try {
-            const data = JSON.parse(dataStr);
-            if (data.type === 'text-delta' && data.delta) {
-              fullText += data.delta;
-            }
-          } catch (e) {}
-        }
+      for (const payload of parsed.payloads) {
+        try {
+          const data = JSON.parse(payload);
+          const textDelta = extractEventText(data);
+          if (textDelta) fullText += textDelta;
+        } catch (e) {}
       }
+    }
+    const flushed = parseSSEPayloads(buffer, true);
+    for (const payload of flushed.payloads) {
+      try {
+        const data = JSON.parse(payload);
+        const textDelta = extractEventText(data);
+        if (textDelta) fullText += textDelta;
+      } catch (e) {}
     }
   } catch (e) {
     throw new Error(`Stream buffering failed: ${e.message}`);
@@ -299,6 +318,86 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
 }
 
 // --- 辅助函数 ---
+
+function extractEventText(data) {
+  if (!data || typeof data !== 'object') return '';
+
+  const textFromValue = (value) => {
+    if (typeof value === 'string' && value) return value;
+    return '';
+  };
+  const textFromList = (list) => {
+    if (!Array.isArray(list)) return;
+    for (const item of list) {
+      if (typeof item === 'string' && item) return item;
+      else if (item && typeof item === 'object') {
+        const candidate = textFromValue(item.text) || textFromValue(item.content);
+        if (candidate) return candidate;
+      }
+    }
+    return '';
+  };
+
+  const directCandidate = textFromValue(data.delta)
+    || textFromValue(data.text)
+    || textFromValue(data.content)
+    || textFromValue(data.message?.content)
+    || textFromList(data.content)
+    || textFromList(data.delta)
+    || textFromList(data.message?.content);
+  if (directCandidate) return directCandidate;
+
+  if (Array.isArray(data.choices)) {
+    for (const choice of data.choices) {
+      const choiceCandidate = textFromValue(choice?.delta?.content)
+        || textFromList(choice?.delta?.content)
+        || textFromValue(choice?.message?.content)
+        || textFromList(choice?.message?.content);
+      if (choiceCandidate) return choiceCandidate;
+    }
+  }
+
+  return '';
+}
+
+function parseSSEPayloads(buffer, flush = false) {
+  let normalized = buffer.replace(/\r/g, '');
+  const payloads = [];
+
+  while (true) {
+    const boundary = normalized.indexOf('\n\n');
+    if (boundary === -1) break;
+
+    const eventBlock = normalized.slice(0, boundary);
+    normalized = normalized.slice(boundary + 2);
+    const payload = extractSSEPayload(eventBlock);
+    if (payload) payloads.push(payload);
+  }
+
+  if (flush && normalized.trim()) {
+    const payload = extractSSEPayload(normalized);
+    if (payload) payloads.push(payload);
+    normalized = '';
+  }
+
+  return { payloads, remainingBuffer: normalized };
+}
+
+function extractSSEPayload(eventBlock) {
+  if (!eventBlock) return '';
+  const dataLines = [];
+
+  for (const line of eventBlock.split('\n')) {
+    if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+
+  if (!dataLines.length) return '';
+  const payload = dataLines.join('\n').trim();
+  if (!payload || payload === '[DONE]') return '';
+  return payload;
+}
 
 function verifyAuth(request, apiKey) {
   const auth = request.headers.get('Authorization');
