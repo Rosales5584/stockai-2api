@@ -401,20 +401,26 @@ function normalizeMessageParts(content) {
     throw new ApiError('messages[*].content 仅支持字符串或文本片段数组', 400, 'invalid_request_error');
   }
 
+  let hasUnsupportedPart = false;
   const parts = content
     .map(part => {
       if (typeof part === 'string') return { type: "text", text: part };
-      if (!part || typeof part !== 'object') return null;
+      if (!part || typeof part !== 'object') {
+        hasUnsupportedPart = true;
+        return null;
+      }
       if (part.type === 'text' && typeof part.text === 'string') return { type: "text", text: part.text };
       if ((part.type === 'input_text' || part.type === 'output_text') && typeof part.text === 'string') {
         return { type: "text", text: part.text };
       }
       if (typeof part.content === 'string') return { type: "text", text: part.content };
+      hasUnsupportedPart = true;
       return null;
     })
     .filter(Boolean);
 
   if (parts.length) return parts;
+  if (!hasUnsupportedPart) return [{ type: "text", text: "" }];
 
   const text = normalizeMessageText(content);
   if (text) return [{ type: "text", text }];
