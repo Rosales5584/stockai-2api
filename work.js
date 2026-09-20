@@ -126,7 +126,7 @@ async function handleChatCompletions(request, requestId) {
     // 1. 转换消息格式 (OpenAI -> StockAI)
     // StockAI 格式: { parts: [{type: "text", text: "..."}], role: "user", id: "..." }
     const convertedMessages = messages.map(msg => ({
-      parts: [{ type: "text", text: normalizeMessageText(msg.content) }],
+      parts: normalizeMessageParts(msg.content),
       id: generateRandomId(16),
       role: msg.role
     }));
@@ -347,7 +347,12 @@ function extractEventText(data) {
   };
 
   if (typeof data.type === 'string') {
-    if (data.type.startsWith('reasoning')) return '';
+    if (data.type.startsWith('reasoning')) {
+      return textFromValue(data.content)
+        || textFromValue(data.message?.content)
+        || textFromList(data.content)
+        || textFromList(data.message?.content);
+    }
     if (data.type === 'text-delta') return textFromValue(data.delta);
     if (data.type === 'text-start' || data.type === 'text-end' || data.type === 'start' || data.type === 'start-step' || data.type === 'finish-step' || data.type === 'finish') {
       return '';
@@ -390,6 +395,31 @@ function normalizeMessageText(content) {
     })
     .filter(Boolean)
     .join('\n');
+}
+
+function normalizeMessageParts(content) {
+  if (typeof content === 'string') {
+    return [{ type: "text", text: content }];
+  }
+
+  if (!Array.isArray(content)) {
+    return [{ type: "text", text: "" }];
+  }
+
+  const parts = content
+    .map(part => {
+      if (typeof part === 'string') return { type: "text", text: part };
+      if (!part || typeof part !== 'object') return null;
+      if (part.type === 'text' && typeof part.text === 'string') return { type: "text", text: part.text };
+      if ((part.type === 'input_text' || part.type === 'output_text') && typeof part.text === 'string') {
+        return { type: "text", text: part.text };
+      }
+      if (typeof part.content === 'string') return { type: "text", text: part.content };
+      return { ...part };
+    })
+    .filter(Boolean);
+
+  return parts.length ? parts : [{ type: "text", text: normalizeMessageText(content) }];
 }
 
 function parseSSEPayloads(buffer, flush = false) {
