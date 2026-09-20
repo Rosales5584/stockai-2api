@@ -420,7 +420,7 @@ function normalizeMessageParts(content) {
 function shouldStreamResponse(body, request) {
   if (typeof body?.stream === 'boolean') return body.stream;
 
-  const accept = request.headers.get('Accept') || '';
+  const accept = (request.headers.get('Accept') || '').toLowerCase();
   if (accept.includes('text/event-stream')) return true;
   if (!accept || accept.includes('application/json') || accept.includes('*/*')) return false;
   return false;
