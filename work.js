@@ -62,7 +62,6 @@ const CONFIG = {
 export default {
   async fetch(request, env, ctx) {
     const apiKey = env.API_MASTER_KEY || CONFIG.API_MASTER_KEY;
-    request.ctx = { apiKey };
 
     const url = new URL(request.url);
 
@@ -70,8 +69,8 @@ export default {
     if (request.method === 'OPTIONS') return handleCorsPreflight();
 
     // 2. 路由分发
-    if (url.pathname === '/') return handleUI(request);
-    if (url.pathname.startsWith('/v1/')) return handleApi(request);
+    if (url.pathname === '/') return handleUI(request, apiKey);
+    if (url.pathname.startsWith('/v1/')) return handleApi(request, apiKey);
     
     return createErrorResponse(`路径未找到: ${url.pathname}`, 404, 'not_found');
   }
@@ -79,9 +78,9 @@ export default {
 
 // --- [第三部分: API 代理逻辑] ---
 
-async function handleApi(request) {
+async function handleApi(request, apiKey) {
   // 鉴权
-  if (!verifyAuth(request)) {
+  if (!verifyAuth(request, apiKey)) {
     return createErrorResponse('Unauthorized', 401, 'auth_error');
   }
 
@@ -190,8 +189,8 @@ function handleStreamResponse(upstreamResponse, model, requestId, isWebUI) {
         buffer = lines.pop() || "";
 
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const dataStr = line.slice(6).trim();
+          if (line.startsWith('data:')) {
+            const dataStr = line.slice(5).trim();
             if (!dataStr || dataStr === '[DONE]') continue;
 
             try {
@@ -265,8 +264,8 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const dataStr = line.slice(6).trim();
+        if (line.startsWith('data:')) {
+          const dataStr = line.slice(5).trim();
           if (!dataStr || dataStr === '[DONE]') continue;
           try {
             const data = JSON.parse(dataStr);
@@ -301,9 +300,9 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
 
 // --- 辅助函数 ---
 
-function verifyAuth(request) {
+function verifyAuth(request, apiKey) {
   const auth = request.headers.get('Authorization');
-  const key = request.ctx.apiKey;
+  const key = apiKey;
   if (key === "1") return true;
   return auth === `Bearer ${key}`;
 }
@@ -335,9 +334,8 @@ function handleCorsPreflight() {
 }
 
 // --- [第四部分: 开发者驾驶舱 UI] ---
-function handleUI(request) {
+function handleUI(request, apiKey) {
   const origin = new URL(request.url).origin;
-  const apiKey = request.ctx.apiKey;
   
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -490,16 +488,23 @@ function handleUI(request) {
                     const reader = res.body.getReader();
                     const decoder = new TextDecoder();
                     aiMsg.innerText = "";
+                    let buffer = "";
+                    let receivedDone = false;
 
-                    while (true) {
+                    while (!receivedDone) {
                         const { done, value } = await reader.read();
                         if (done) break;
-                        const chunk = decoder.decode(value);
-                        const lines = chunk.split('\\n');
+                        buffer += decoder.decode(value, { stream: true });
+                        const lines = buffer.split('\\n');
+                        buffer = lines.pop() || "";
                         for (const line of lines) {
-                            if (line.startsWith('data: ')) {
-                                const dataStr = line.slice(6);
-                                if (dataStr === '[DONE]') break;
+                            if (line.startsWith('data:')) {
+                                const dataStr = line.slice(5).trim();
+                                if (!dataStr) continue;
+                                if (dataStr === '[DONE]') {
+                                    receivedDone = true;
+                                    break;
+                                }
                                 try {
                                     const json = JSON.parse(dataStr);
                                     const content = json.choices[0].delta.content;
