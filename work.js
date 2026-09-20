@@ -164,7 +164,7 @@ async function handleChatCompletions(request, requestId) {
     }
 
   } catch (e) {
-    return createErrorResponse(e.message, e.status || 500, e.code || 'internal_error');
+    return createErrorResponse(e.message, e.status ?? 500, e.code ?? 'internal_error');
   }
 }
 
@@ -346,7 +346,17 @@ function extractEventDelta(data) {
 
   if (typeof data.type === 'string') {
     if (data.type === 'reasoning-delta') return { content: '', reasoning: textFromValue(data.delta) };
-    if (data.type.startsWith('reasoning')) return { content: '', reasoning: '' };
+    if (data.type.startsWith('reasoning')) {
+      return {
+        content: '',
+        reasoning: textFromValue(data.delta)
+          || textFromValue(data.text)
+          || textFromValue(data.content)
+          || textFromList(data.content)
+          || textFromList(data.delta)
+          || textFromList(data.message?.content)
+      };
+    }
     if (data.type === 'text-delta') return { content: textFromValue(data.delta), reasoning: '' };
     if (data.type === 'text-start' || data.type === 'text-end' || data.type === 'start' || data.type === 'start-step' || data.type === 'finish-step' || data.type === 'finish') {
       return { content: '', reasoning: '' };
