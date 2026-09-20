@@ -205,6 +205,7 @@ function handleStreamResponse(upstreamResponse, model, requestId, isWebUI) {
           } catch (e) { }
         }
       }
+      buffer += decoder.decode();
 
       const flushed = parseSSEPayloads(buffer, true);
       for (const payload of flushed.payloads) {
@@ -277,6 +278,7 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
         } catch (e) {}
       }
     }
+    buffer += decoder.decode();
     const flushed = parseSSEPayloads(buffer, true);
     for (const payload of flushed.payloads) {
       try {
@@ -424,13 +426,75 @@ function parseSSEPayloads(buffer, flush = false) {
     if (payload) payloads.push(payload);
   }
 
+  const lineDelimited = extractLeadingDataLinePayloads(normalized);
+  if (lineDelimited.payloads.length) {
+    payloads.push(...lineDelimited.payloads);
+    normalized = lineDelimited.remainingBuffer;
+  }
+
   if (flush && normalized.trim()) {
     const payload = extractSSEPayload(normalized);
-    if (payload) payloads.push(payload);
-    normalized = '';
+    if (payload) {
+      payloads.push(payload);
+      normalized = '';
+    } else {
+      const flushedLines = extractLeadingDataLinePayloads(normalized, true);
+      if (flushedLines.payloads.length) payloads.push(...flushedLines.payloads);
+      normalized = flushedLines.remainingBuffer;
+      if (normalized.trim()) normalized = '';
+    }
   }
 
   return { payloads, remainingBuffer: normalized };
+}
+
+function extractLeadingDataLinePayloads(buffer, flush = false) {
+  let remaining = buffer;
+  const payloads = [];
+
+  while (true) {
+    const newlineIndex = remaining.indexOf('\n');
+    if (newlineIndex === -1) break;
+
+    const line = remaining.slice(0, newlineIndex);
+    if (!line.startsWith('data:')) break;
+
+    const payload = line.slice(5).trimStart().trimEnd();
+    remaining = remaining.slice(newlineIndex + 1);
+    if (remaining.startsWith('\n')) remaining = remaining.slice(1);
+
+    if (!payload || payload === '[DONE]') continue;
+    if (!isCompleteJSONPayload(payload)) {
+      remaining = `${line}\n${remaining}`;
+      break;
+    }
+
+    payloads.push(payload);
+  }
+
+  if (flush && remaining.startsWith('data:')) {
+    const payload = remaining.slice(5).trimStart().trimEnd();
+    if (payload && payload !== '[DONE]' && isCompleteJSONPayload(payload)) {
+      payloads.push(payload);
+      remaining = '';
+    }
+  }
+
+  return { payloads, remainingBuffer: remaining };
+}
+
+function isCompleteJSONPayload(payload) {
+  if (!payload) return false;
+  if (payload === '[DONE]') return true;
+  const first = payload[0];
+  if (first !== '{' && first !== '[') return false;
+
+  try {
+    JSON.parse(payload);
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 
 function extractSSEPayload(eventBlock) {
@@ -644,25 +708,40 @@ function handleUI(request, apiKey) {
                         const { done, value } = await reader.read();
                         if (done) break;
                         buffer += decoder.decode(value, { stream: true });
-                        const lines = buffer.split('\\n');
-                        buffer = lines.pop() || "";
-                        for (const line of lines) {
-                            if (line.startsWith('data:')) {
-                                const dataStr = line.slice(5).trim();
-                                if (!dataStr) continue;
-                                if (dataStr === '[DONE]') {
-                                    receivedDone = true;
-                                    break;
-                                }
-                                try {
-                                    const json = JSON.parse(dataStr);
-                                    const content = json.choices[0].delta.content;
-                                    if (content) {
-                                        fullText += content;
-                                        aiMsg.innerText = fullText;
-                                    }
-                                } catch (e) {}
+                        const parsed = parseUISSEPayloads(buffer);
+                        buffer = parsed.remainingBuffer;
+                        for (const dataStr of parsed.payloads) {
+                            if (dataStr === '[DONE]') {
+                                receivedDone = true;
+                                break;
                             }
+                            try {
+                                const json = JSON.parse(dataStr);
+                                const delta = json.choices?.[0]?.delta || {};
+                                const content = typeof delta.content === 'string' ? delta.content : '';
+                                const reasoning = typeof delta.reasoning_content === 'string' ? delta.reasoning_content : '';
+                                if (content) {
+                                    fullText += content;
+                                    aiMsg.innerText = fullText;
+                                } else if (!fullText && reasoning) {
+                                    aiMsg.innerText = reasoning;
+                                }
+                            } catch (e) {}
+                        }
+                    }
+                    buffer += decoder.decode();
+                    if (!receivedDone && buffer) {
+                        const parsed = parseUISSEPayloads(buffer, true);
+                        for (const dataStr of parsed.payloads) {
+                            if (dataStr === '[DONE]') break;
+                            try {
+                                const json = JSON.parse(dataStr);
+                                const content = json.choices?.[0]?.delta?.content;
+                                if (content) {
+                                    fullText += content;
+                                    aiMsg.innerText = fullText;
+                                }
+                            } catch (e) {}
                         }
                     }
                 } else {
@@ -679,6 +758,51 @@ function handleUI(request, apiKey) {
                 btn.disabled = false;
                 btn.innerText = "发送请求";
             }
+        }
+
+        function parseUISSEPayloads(buffer, flush = false) {
+            let normalized = buffer.replace(/\\r/g, '');
+            const payloads = [];
+
+            while (true) {
+                const boundary = normalized.indexOf('\\n\\n');
+                if (boundary === -1) break;
+                const eventBlock = normalized.slice(0, boundary);
+                normalized = normalized.slice(boundary + 2);
+                const payload = extractUISSEPayload(eventBlock);
+                if (payload) payloads.push(payload);
+            }
+
+            while (true) {
+                const newlineIndex = normalized.indexOf('\\n');
+                if (newlineIndex === -1) break;
+                const line = normalized.slice(0, newlineIndex);
+                if (!line.startsWith('data:')) break;
+                const payload = line.slice(5).trim();
+                normalized = normalized.slice(newlineIndex + 1);
+                if (normalized.startsWith('\\n')) normalized = normalized.slice(1);
+                if (payload) payloads.push(payload);
+            }
+
+            if (flush && normalized.trim()) {
+                const payload = extractUISSEPayload(normalized);
+                if (payload) {
+                    payloads.push(payload);
+                    normalized = '';
+                }
+            }
+
+            return { payloads, remainingBuffer: normalized };
+        }
+
+        function extractUISSEPayload(eventBlock) {
+            if (!eventBlock) return '';
+            const dataLines = [];
+            for (const line of eventBlock.split('\\n')) {
+                if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+            }
+            if (!dataLines.length) return '';
+            return dataLines.join('\\n').trim();
         }
     </script>
 </body>
