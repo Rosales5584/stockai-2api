@@ -164,7 +164,7 @@ async function handleChatCompletions(request, requestId) {
     }
 
   } catch (e) {
-    return createErrorResponse(e.message, 500, 'internal_error');
+    return createErrorResponse(e.message, e.status || 500, e.code || 'internal_error');
   }
 }
 
@@ -398,7 +398,7 @@ function normalizeMessageParts(content) {
   }
 
   if (!Array.isArray(content)) {
-    return [{ type: "text", text: "" }];
+    throw new ApiError('messages[*].content 仅支持字符串或文本片段数组', 400, 'invalid_request_error');
   }
 
   const parts = content
@@ -410,11 +410,25 @@ function normalizeMessageParts(content) {
         return { type: "text", text: part.text };
       }
       if (typeof part.content === 'string') return { type: "text", text: part.content };
-      return { ...part };
+      return null;
     })
     .filter(Boolean);
 
-  return parts.length ? parts : [{ type: "text", text: normalizeMessageText(content) }];
+  if (parts.length) return parts;
+
+  const text = normalizeMessageText(content);
+  if (text) return [{ type: "text", text }];
+
+  throw new ApiError('暂不支持非文本消息内容', 400, 'invalid_request_error');
+}
+
+class ApiError extends Error {
+  constructor(message, status, code) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+  }
 }
 
 function shouldStreamResponse(body, request) {
