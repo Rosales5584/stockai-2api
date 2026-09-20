@@ -347,12 +347,7 @@ function extractEventText(data) {
   };
 
   if (typeof data.type === 'string') {
-    if (data.type.startsWith('reasoning')) {
-      return textFromValue(data.content)
-        || textFromValue(data.message?.content)
-        || textFromList(data.content)
-        || textFromList(data.message?.content);
-    }
+    if (data.type.startsWith('reasoning')) return '';
     if (data.type === 'text-delta') return textFromValue(data.delta);
     if (data.type === 'text-start' || data.type === 'text-end' || data.type === 'start' || data.type === 'start-step' || data.type === 'finish-step' || data.type === 'finish') {
       return '';
