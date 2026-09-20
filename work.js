@@ -57,7 +57,8 @@ async function handleChatCompletions(request, apiKey) {
     const body = await request.json();
     const model = body.model || CONFIG.DEFAULT_MODEL;
     const stream = shouldStreamResponse(body, request);
-    const upstreamResponse = await fetchUpstreamChat(body, model);
+    const toolConfig = buildToolConfig(body);
+    const upstreamResponse = await fetchUpstreamChat(body, model, toolConfig);
 
     if (!upstreamResponse.ok) {
       const errorText = await upstreamResponse.text();
@@ -69,10 +70,10 @@ async function handleChatCompletions(request, apiKey) {
     }
 
     if (stream) {
-      return streamAsOpenAI(upstreamResponse.body, { model, requestId });
+      return streamAsOpenAI(upstreamResponse.body, { model, requestId, toolConfig });
     }
 
-    return readAsOpenAIJson(upstreamResponse.body, { model, requestId });
+    return readAsOpenAIJson(upstreamResponse.body, { model, requestId, toolConfig });
   } catch (error) {
     return createErrorResponse(error.message || 'Unknown error', error.status || 500, error.code || 'internal_error');
   }
@@ -90,12 +91,12 @@ function handleModels() {
   });
 }
 
-async function fetchUpstreamChat(body, model) {
+async function fetchUpstreamChat(body, model, toolConfig) {
   const upstreamPayload = {
     model,
     webSearch: false,
     id: body.id || generateRandomId(16),
-    messages: normalizeMessages(body.messages),
+    messages: normalizeMessages(body.messages, toolConfig),
     trigger: 'submit-message',
   };
 
@@ -106,14 +107,21 @@ async function fetchUpstreamChat(body, model) {
   });
 }
 
-function normalizeMessages(messages) {
-  if (!Array.isArray(messages)) return [];
+function normalizeMessages(messages, toolConfig) {
+  const normalized = [];
 
-  return messages.map((message) => ({
-    id: generateRandomId(16),
-    role: message?.role || 'user',
-    parts: [{ type: 'text', text: normalizeMessageContent(message?.content) }],
-  }));
+  if (toolConfig.enabled) {
+    normalized.push(createUpstreamMessage('system', toolConfig.instructions));
+  }
+
+  if (!Array.isArray(messages)) return normalized;
+
+  for (const message of messages) {
+    const upstreamMessage = normalizeMessageForUpstream(message);
+    if (upstreamMessage) normalized.push(upstreamMessage);
+  }
+
+  return normalized;
 }
 
 function normalizeMessageContent(content) {
@@ -130,6 +138,100 @@ function normalizeMessageContent(content) {
     })
     .filter(Boolean)
     .join('\n');
+}
+
+function normalizeMessageForUpstream(message) {
+  if (!message || typeof message !== 'object') return null;
+
+  const role = message.role || 'user';
+  const parts = [];
+  const content = normalizeMessageContent(message.content);
+
+  if (role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length) {
+    parts.push(formatAssistantToolCalls(message.tool_calls));
+  }
+
+  if (role === 'tool') {
+    parts.push(formatToolResult(message));
+  } else if (content) {
+    parts.push(content);
+  }
+
+  if (!parts.length) return null;
+
+  if (role === 'tool') return createUpstreamMessage('user', parts.join('\n\n'));
+  if (role === 'system') return createUpstreamMessage('system', parts.join('\n\n'));
+  if (role === 'assistant') return createUpstreamMessage('assistant', parts.join('\n\n'));
+  return createUpstreamMessage('user', parts.join('\n\n'));
+}
+
+function createUpstreamMessage(role, text) {
+  return {
+    id: generateRandomId(16),
+    role,
+    parts: [{ type: 'text', text }],
+  };
+}
+
+function formatAssistantToolCalls(toolCalls) {
+  const normalizedCalls = toolCalls
+    .map((toolCall) => {
+      const name = toolCall?.function?.name;
+      if (!name) return '';
+      const args = typeof toolCall?.function?.arguments === 'string'
+        ? toolCall.function.arguments
+        : JSON.stringify(toolCall?.function?.arguments || {});
+      return `[assistant_tool_call]\nname: ${name}\narguments: ${args}`;
+    })
+    .filter(Boolean);
+
+  return normalizedCalls.join('\n\n');
+}
+
+function formatToolResult(message) {
+  const identifier = message.name || message.tool_call_id || 'tool';
+  const content = normalizeMessageContent(message.content) || '';
+  return `[tool_result]\nname: ${identifier}\ncontent:\n${content}`;
+}
+
+function buildToolConfig(body) {
+  const tools = Array.isArray(body?.tools)
+    ? body.tools.filter((tool) => tool?.type === 'function' && tool?.function?.name)
+    : [];
+  const toolChoice = body?.tool_choice;
+  const enabled = tools.length > 0 && toolChoice !== 'none';
+
+  return {
+    enabled,
+    tools,
+    toolChoice,
+    instructions: enabled ? buildToolSystemPrompt(tools, toolChoice) : '',
+  };
+}
+
+function buildToolSystemPrompt(tools, toolChoice) {
+  const toolList = tools.map((tool) => JSON.stringify({
+    name: tool.function.name,
+    description: tool.function.description || '',
+    parameters: tool.function.parameters || {},
+  })).join('\n');
+
+  const choiceInstruction = toolChoice === 'required'
+    ? '你必须至少调用一个工具。'
+    : (toolChoice && typeof toolChoice === 'object' && toolChoice.type === 'function' && toolChoice.function?.name)
+      ? `你必须调用这个工具：${toolChoice.function.name}。`
+      : '如果需要外部能力或结构化动作，就调用工具；否则直接正常回答。';
+
+  return [
+    '你正在被一个 OpenAI 兼容 API 适配器调用。',
+    '以下是可用工具定义：',
+    toolList,
+    choiceInstruction,
+    '当你决定调用工具时，必须只输出严格 JSON，且不要添加 Markdown 代码块、解释或额外文本。',
+    'JSON 格式必须是：{"tool_calls":[{"id":"call_xxx","type":"function","function":{"name":"工具名","arguments":"{\\"key\\":\\"value\\"}"}}]}。',
+    'arguments 必须是 JSON 字符串。',
+    '如果不需要调用工具，直接输出最终自然语言答案。',
+  ].join('\n');
 }
 
 function shouldStreamResponse(body, request) {
@@ -172,7 +274,7 @@ function generateRandomId(length) {
   return result;
 }
 
-function streamAsOpenAI(upstreamBody, { model, requestId }) {
+function streamAsOpenAI(upstreamBody, { model, requestId, toolConfig }) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -181,24 +283,57 @@ function streamAsOpenAI(upstreamBody, { model, requestId }) {
     try {
       await writeSSE(writer, encoder, createChunk(requestId, model, { role: 'assistant' }));
 
-      for await (const event of iterateUpstreamEvents(upstreamBody)) {
-        if (event.done) break;
-        const delta = extractEventDelta(event.data);
-        if (delta.reasoning) {
-          await writeSSE(writer, encoder, createChunk(requestId, model, { reasoning_content: delta.reasoning }));
-        }
-        if (delta.content) {
-          await writeSSE(writer, encoder, createChunk(requestId, model, { content: delta.content }));
-        }
-      }
+      if (toolConfig.enabled) {
+        let content = '';
+        let reasoning = '';
 
-      await writeSSE(writer, encoder, {
-        id: requestId,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-      });
+        for await (const event of iterateUpstreamEvents(upstreamBody)) {
+          if (event.done) break;
+          const delta = extractEventDelta(event.data);
+          if (delta.reasoning) reasoning += delta.reasoning;
+          if (delta.content) content += delta.content;
+        }
+
+        if (reasoning) {
+          await writeSSE(writer, encoder, createChunk(requestId, model, { reasoning_content: reasoning }));
+        }
+
+        const interpreted = interpretAssistantOutput(content, toolConfig);
+        if (interpreted.toolCalls.length) {
+          for (let index = 0; index < interpreted.toolCalls.length; index += 1) {
+            const toolCall = interpreted.toolCalls[index];
+            await writeSSE(writer, encoder, createToolCallChunk(requestId, model, toolCall, index));
+          }
+          await writeSSE(writer, encoder, {
+            id: requestId,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+          });
+        } else if (interpreted.content) {
+          await writeSSE(writer, encoder, createChunk(requestId, model, { content: interpreted.content }));
+        }
+      } else {
+        for await (const event of iterateUpstreamEvents(upstreamBody)) {
+          if (event.done) break;
+          const delta = extractEventDelta(event.data);
+          if (delta.reasoning) {
+            await writeSSE(writer, encoder, createChunk(requestId, model, { reasoning_content: delta.reasoning }));
+          }
+          if (delta.content) {
+            await writeSSE(writer, encoder, createChunk(requestId, model, { content: delta.content }));
+          }
+        }
+
+        await writeSSE(writer, encoder, {
+          id: requestId,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+        });
+      }
       await writer.write(encoder.encode('data: [DONE]\n\n'));
     } catch (error) {
       await writeSSE(writer, encoder, createChunk(requestId, model, { content: `\n\n[Error: ${error.message}]` }, 'error'));
@@ -216,7 +351,7 @@ function streamAsOpenAI(upstreamBody, { model, requestId }) {
   });
 }
 
-async function readAsOpenAIJson(upstreamBody, { model, requestId }) {
+async function readAsOpenAIJson(upstreamBody, { model, requestId, toolConfig }) {
   let content = '';
   let reasoning = '';
 
@@ -227,6 +362,20 @@ async function readAsOpenAIJson(upstreamBody, { model, requestId }) {
     if (delta.content) content += delta.content;
   }
 
+  const interpreted = interpretAssistantOutput(content, toolConfig);
+  const message = interpreted.toolCalls.length
+    ? {
+      role: 'assistant',
+      content: null,
+      tool_calls: interpreted.toolCalls,
+      ...(reasoning ? { reasoning_content: reasoning } : {}),
+    }
+    : {
+      role: 'assistant',
+      content: interpreted.content,
+      ...(reasoning ? { reasoning_content: reasoning } : {}),
+    };
+
   return jsonResponse({
     id: requestId,
     object: 'chat.completion',
@@ -234,12 +383,8 @@ async function readAsOpenAIJson(upstreamBody, { model, requestId }) {
     model,
     choices: [{
       index: 0,
-      message: {
-        role: 'assistant',
-        content,
-        ...(reasoning ? { reasoning_content: reasoning } : {}),
-      },
-      finish_reason: 'stop',
+      message,
+      finish_reason: interpreted.toolCalls.length ? 'tool_calls' : 'stop',
     }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   });
@@ -252,6 +397,30 @@ function createChunk(requestId, model, delta, finishReason = null) {
     created: Math.floor(Date.now() / 1000),
     model,
     choices: [{ index: 0, delta, finish_reason: finishReason }],
+  };
+}
+
+function createToolCallChunk(requestId, model, toolCall, index) {
+  return {
+    id: requestId,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{
+      index: 0,
+      delta: {
+        tool_calls: [{
+          index,
+          id: toolCall.id,
+          type: 'function',
+          function: {
+            name: toolCall.function.name,
+            arguments: toolCall.function.arguments,
+          },
+        }],
+      },
+      finish_reason: null,
+    }],
   };
 }
 
@@ -368,6 +537,59 @@ function tryParseJSON(payload) {
   } catch {
     return null;
   }
+}
+
+function interpretAssistantOutput(content, toolConfig) {
+  if (!toolConfig?.enabled) {
+    return { content, toolCalls: [] };
+  }
+
+  const toolCalls = parseToolCallsFromText(content);
+  if (toolCalls.length) {
+    return { content: '', toolCalls };
+  }
+
+  return { content, toolCalls: [] };
+}
+
+function parseToolCallsFromText(content) {
+  if (typeof content !== 'string') return [];
+  const normalized = stripMarkdownCodeFence(content.trim());
+  if (!normalized) return [];
+
+  const parsed = tryParseJSON(normalized);
+  if (!parsed || !Array.isArray(parsed.tool_calls)) return [];
+
+  return parsed.tool_calls
+    .map((toolCall, index) => normalizeToolCall(toolCall, index))
+    .filter(Boolean);
+}
+
+function normalizeToolCall(toolCall, index) {
+  if (!toolCall || typeof toolCall !== 'object') return null;
+
+  const name = toolCall?.function?.name || toolCall?.name;
+  if (!name) return null;
+
+  const rawArguments = toolCall?.function?.arguments ?? toolCall?.arguments ?? {};
+  const argumentsText = typeof rawArguments === 'string' ? rawArguments : JSON.stringify(rawArguments);
+
+  return {
+    id: typeof toolCall.id === 'string' && toolCall.id ? toolCall.id : `call_${generateRandomId(12)}_${index}`,
+    type: 'function',
+    function: {
+      name,
+      arguments: argumentsText,
+    },
+  };
+}
+
+function stripMarkdownCodeFence(content) {
+  if (!content.startsWith('```')) return content;
+  return content
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '')
+    .trim();
 }
 
 function extractEventDelta(data) {
