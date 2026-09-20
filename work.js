@@ -120,7 +120,7 @@ async function handleChatCompletions(request, requestId) {
     const body = await request.json();
     const model = body.model || CONFIG.DEFAULT_MODEL;
     const messages = body.messages || [];
-    const stream = body.stream === true;
+    const stream = shouldStreamResponse(body, request);
     const isWebUI = body.is_web_ui === true;
 
     // 1. 转换消息格式 (OpenAI -> StockAI)
@@ -415,6 +415,16 @@ function normalizeMessageParts(content) {
     .filter(Boolean);
 
   return parts.length ? parts : [{ type: "text", text: normalizeMessageText(content) }];
+}
+
+function shouldStreamResponse(body, request) {
+  if (typeof body?.stream === 'boolean') return body.stream;
+
+  const accept = request.headers.get('Accept') || '';
+  if (accept.includes('text/event-stream')) return true;
+  if (accept.includes('application/json')) return false;
+
+  return true;
 }
 
 function parseSSEPayloads(buffer, flush = false) {
