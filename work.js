@@ -120,13 +120,13 @@ async function handleChatCompletions(request, requestId) {
     const body = await request.json();
     const model = body.model || CONFIG.DEFAULT_MODEL;
     const messages = body.messages || [];
-    const stream = body.stream !== false; // 默认为 true，除非显式设为 false
+    const stream = body.stream === true;
     const isWebUI = body.is_web_ui === true;
 
     // 1. 转换消息格式 (OpenAI -> StockAI)
     // StockAI 格式: { parts: [{type: "text", text: "..."}], role: "user", id: "..." }
     const convertedMessages = messages.map(msg => ({
-      parts: [{ type: "text", text: msg.content }],
+      parts: [{ type: "text", text: normalizeMessageText(msg.content) }],
       id: generateRandomId(16),
       role: msg.role
     }));
@@ -179,6 +179,14 @@ function handleStreamResponse(upstreamResponse, model, requestId, isWebUI) {
     try {
       const reader = upstreamResponse.body.getReader();
       let buffer = "";
+      const startChunk = {
+        id: requestId,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
+      };
+      await writer.write(encoder.encode(`data: ${JSON.stringify(startChunk)}\n\n`));
 
       while (true) {
         const { done, value } = await reader.read();
@@ -358,6 +366,22 @@ function extractEventText(data) {
   }
 
   return '';
+}
+
+function normalizeMessageText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+
+  return content
+    .map(part => {
+      if (typeof part === 'string') return part;
+      if (!part || typeof part !== 'object') return '';
+      if (part.type === 'text' && typeof part.text === 'string') return part.text;
+      if (typeof part.content === 'string') return part.content;
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
 }
 
 function parseSSEPayloads(buffer, flush = false) {
