@@ -126,7 +126,7 @@ async function handleChatCompletions(request, requestId) {
     // 1. 转换消息格式 (OpenAI -> StockAI)
     // StockAI 格式: { parts: [{type: "text", text: "..."}], role: "user", id: "..." }
     const convertedMessages = messages.map(msg => ({
-      parts: normalizeMessageParts(msg.content),
+      parts: [{ type: "text", text: normalizeMessageText(msg.content) }],
       id: generateRandomId(16),
       role: msg.role
     }));
@@ -164,7 +164,7 @@ async function handleChatCompletions(request, requestId) {
     }
 
   } catch (e) {
-    return createErrorResponse(e.message, 500, 'internal_error');
+    return createErrorResponse(e.message, e.status ?? 500, e.code ?? 'internal_error');
   }
 }
 
@@ -199,21 +199,9 @@ function handleStreamResponse(upstreamResponse, model, requestId, isWebUI) {
         for (const payload of parsed.payloads) {
           try {
             const data = JSON.parse(payload);
-            const textDelta = extractEventText(data);
-            if (textDelta) {
-              const chunk = {
-                id: requestId,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model: model,
-                choices: [{ index: 0, delta: { content: textDelta }, finish_reason: null }]
-              };
-              await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-            }
-            // 处理结束
-            else if (data.type === 'finish') {
-               // Do nothing, wait for loop end or explicit stop
-            }
+            const delta = extractEventDelta(data);
+            if (delta.reasoning) await writeDeltaChunk(writer, encoder, requestId, model, { reasoning_content: delta.reasoning });
+            if (delta.content) await writeDeltaChunk(writer, encoder, requestId, model, { content: delta.content });
           } catch (e) { }
         }
       }
@@ -222,17 +210,9 @@ function handleStreamResponse(upstreamResponse, model, requestId, isWebUI) {
       for (const payload of flushed.payloads) {
         try {
           const data = JSON.parse(payload);
-          const textDelta = extractEventText(data);
-          if (textDelta) {
-            const chunk = {
-              id: requestId,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: model,
-              choices: [{ index: 0, delta: { content: textDelta }, finish_reason: null }]
-            };
-            await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-          }
+          const delta = extractEventDelta(data);
+          if (delta.reasoning) await writeDeltaChunk(writer, encoder, requestId, model, { reasoning_content: delta.reasoning });
+          if (delta.content) await writeDeltaChunk(writer, encoder, requestId, model, { content: delta.content });
         } catch (e) { }
       }
       buffer = flushed.remainingBuffer;
@@ -276,6 +256,7 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
   const reader = upstreamResponse.body.getReader();
   const decoder = new TextDecoder();
   let fullText = "";
+  let fullReasoning = "";
   let buffer = "";
 
   try {
@@ -290,8 +271,9 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
       for (const payload of parsed.payloads) {
         try {
           const data = JSON.parse(payload);
-          const textDelta = extractEventText(data);
-          if (textDelta) fullText += textDelta;
+          const delta = extractEventDelta(data);
+          if (delta.reasoning) fullReasoning += delta.reasoning;
+          if (delta.content) fullText += delta.content;
         } catch (e) {}
       }
     }
@@ -299,8 +281,9 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
     for (const payload of flushed.payloads) {
       try {
         const data = JSON.parse(payload);
-        const textDelta = extractEventText(data);
-        if (textDelta) fullText += textDelta;
+        const delta = extractEventDelta(data);
+        if (delta.reasoning) fullReasoning += delta.reasoning;
+        if (delta.content) fullText += delta.content;
       } catch (e) {}
     }
   } catch (e) {
@@ -314,7 +297,11 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
     model: model,
     choices: [{
       index: 0,
-      message: { role: "assistant", content: fullText },
+      message: {
+        role: "assistant",
+        content: fullText,
+        ...(fullReasoning ? { reasoning_content: fullReasoning } : {})
+      },
       finish_reason: "stop"
     }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
@@ -327,8 +314,19 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
 
 // --- 辅助函数 ---
 
-function extractEventText(data) {
-  if (!data || typeof data !== 'object') return '';
+async function writeDeltaChunk(writer, encoder, requestId, model, delta) {
+  const chunk = {
+    id: requestId,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: model,
+    choices: [{ index: 0, delta, finish_reason: null }]
+  };
+  await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+}
+
+function extractEventDelta(data) {
+  if (!data || typeof data !== 'object') return { content: '', reasoning: '' };
 
   const textFromValue = (value) => {
     if (typeof value === 'string' && value) return value;
@@ -347,10 +345,21 @@ function extractEventText(data) {
   };
 
   if (typeof data.type === 'string') {
-    if (data.type.startsWith('reasoning')) return '';
-    if (data.type === 'text-delta') return textFromValue(data.delta);
+    if (data.type === 'reasoning-delta') return { content: '', reasoning: textFromValue(data.delta) };
+    if (data.type.startsWith('reasoning')) {
+      return {
+        content: '',
+        reasoning: textFromValue(data.delta)
+          || textFromValue(data.text)
+          || textFromValue(data.content)
+          || textFromList(data.content)
+          || textFromList(data.delta)
+          || textFromList(data.message?.content)
+      };
+    }
+    if (data.type === 'text-delta') return { content: textFromValue(data.delta), reasoning: '' };
     if (data.type === 'text-start' || data.type === 'text-end' || data.type === 'start' || data.type === 'start-step' || data.type === 'finish-step' || data.type === 'finish') {
-      return '';
+      return { content: '', reasoning: '' };
     }
   }
 
@@ -361,7 +370,7 @@ function extractEventText(data) {
     || textFromList(data.content)
     || textFromList(data.delta)
     || textFromList(data.message?.content);
-  if (directCandidate) return directCandidate;
+  if (directCandidate) return { content: directCandidate, reasoning: '' };
 
   if (Array.isArray(data.choices)) {
     for (const choice of data.choices) {
@@ -369,11 +378,11 @@ function extractEventText(data) {
         || textFromList(choice?.delta?.content)
         || textFromValue(choice?.message?.content)
         || textFromList(choice?.message?.content);
-      if (choiceCandidate) return choiceCandidate;
+      if (choiceCandidate) return { content: choiceCandidate, reasoning: '' };
     }
   }
 
-  return '';
+  return { content: '', reasoning: '' };
 }
 
 function normalizeMessageText(content) {
@@ -390,31 +399,6 @@ function normalizeMessageText(content) {
     })
     .filter(Boolean)
     .join('\n');
-}
-
-function normalizeMessageParts(content) {
-  if (typeof content === 'string') {
-    return [{ type: "text", text: content }];
-  }
-
-  if (!Array.isArray(content)) {
-    return [{ type: "text", text: "" }];
-  }
-
-  const parts = content
-    .map(part => {
-      if (typeof part === 'string') return { type: "text", text: part };
-      if (!part || typeof part !== 'object') return null;
-      if (part.type === 'text' && typeof part.text === 'string') return { type: "text", text: part.text };
-      if ((part.type === 'input_text' || part.type === 'output_text') && typeof part.text === 'string') {
-        return { type: "text", text: part.text };
-      }
-      if (typeof part.content === 'string') return { type: "text", text: part.content };
-      return { ...part };
-    })
-    .filter(Boolean);
-
-  return parts.length ? parts : [{ type: "text", text: normalizeMessageText(content) }];
 }
 
 function shouldStreamResponse(body, request) {
