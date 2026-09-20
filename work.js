@@ -346,6 +346,14 @@ function extractEventText(data) {
     return '';
   };
 
+  if (typeof data.type === 'string') {
+    if (data.type.startsWith('reasoning')) return '';
+    if (data.type === 'text-delta') return textFromValue(data.delta);
+    if (data.type === 'text-start' || data.type === 'text-end' || data.type === 'start' || data.type === 'start-step' || data.type === 'finish-step' || data.type === 'finish') {
+      return '';
+    }
+  }
+
   const directCandidate = textFromValue(data.delta)
     || textFromValue(data.text)
     || textFromValue(data.content)
