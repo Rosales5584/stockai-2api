@@ -189,8 +189,8 @@ function handleStreamResponse(upstreamResponse, model, requestId, isWebUI) {
         buffer = lines.pop() || "";
 
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const dataStr = line.slice(6).trim();
+          if (line.startsWith('data:')) {
+            const dataStr = line.slice(5).trim();
             if (!dataStr || dataStr === '[DONE]') continue;
 
             try {
@@ -264,8 +264,8 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const dataStr = line.slice(6).trim();
+        if (line.startsWith('data:')) {
+          const dataStr = line.slice(5).trim();
           if (!dataStr || dataStr === '[DONE]') continue;
           try {
             const data = JSON.parse(dataStr);
@@ -498,8 +498,8 @@ function handleUI(request, apiKey) {
                         const lines = buffer.split('\\n');
                         buffer = lines.pop() || "";
                         for (const line of lines) {
-                            if (line.startsWith('data: ')) {
-                                const dataStr = line.slice(6).trim();
+                            if (line.startsWith('data:')) {
+                                const dataStr = line.slice(5).trim();
                                 if (!dataStr) continue;
                                 if (dataStr === '[DONE]') {
                                     receivedDone = true;
