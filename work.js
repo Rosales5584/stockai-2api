@@ -422,9 +422,8 @@ function shouldStreamResponse(body, request) {
 
   const accept = request.headers.get('Accept') || '';
   if (accept.includes('text/event-stream')) return true;
-  if (accept.includes('application/json')) return false;
-
-  return true;
+  if (!accept || accept.includes('application/json') || accept.includes('*/*')) return false;
+  return false;
 }
 
 function parseSSEPayloads(buffer, flush = false) {
