@@ -488,16 +488,23 @@ function handleUI(request, apiKey) {
                     const reader = res.body.getReader();
                     const decoder = new TextDecoder();
                     aiMsg.innerText = "";
+                    let buffer = "";
+                    let receivedDone = false;
 
-                    while (true) {
+                    while (!receivedDone) {
                         const { done, value } = await reader.read();
                         if (done) break;
-                        const chunk = decoder.decode(value);
-                        const lines = chunk.split('\\n');
+                        buffer += decoder.decode(value, { stream: true });
+                        const lines = buffer.split('\\n');
+                        buffer = lines.pop() || "";
                         for (const line of lines) {
                             if (line.startsWith('data: ')) {
-                                const dataStr = line.slice(6);
-                                if (dataStr === '[DONE]') break;
+                                const dataStr = line.slice(6).trim();
+                                if (!dataStr) continue;
+                                if (dataStr === '[DONE]') {
+                                    receivedDone = true;
+                                    break;
+                                }
                                 try {
                                     const json = JSON.parse(dataStr);
                                     const content = json.choices[0].delta.content;
